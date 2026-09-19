@@ -1,5 +1,7 @@
 *.o
 nbody_direct_serial
+nbody_omp
 generate_ic
 *.bin
+*.out
 .DS_Store

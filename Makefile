@@ -2,11 +2,12 @@ CC        ?= cc
 STD       ?= -std=c11
 CPPFLAGS  ?=
 CFLAGS    ?= -O2 -Wall -Wextra -Wpedantic
+OMPFLAGS  ?= -fopenmp
 LDLIBS    ?= -lm
 PRECISION ?= double
 
 PROGRAMS := nbody_direct_serial generate_ic
-HEADERS  := nbody_common.h
+HEADERS  := nbody_common.h utils/timing.h
 
 ifeq ($(PRECISION),float)
 PRECISION_CPPFLAGS := -DNBODY_USE_FLOAT
@@ -23,6 +24,9 @@ all: $(PROGRAMS)
 nbody_direct_serial: nbody_direct_serial.c $(HEADERS)
 	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
 
+nbody_omp: nbody_direct_serial.c $(HEADERS)
+	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) $(OMPFLAGS) -o $@ $< $(LDLIBS)
+
 generate_ic: generate_ic.c $(HEADERS)
 	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
 
@@ -34,4 +38,4 @@ run-smoke: all
 	./nbody_direct_serial --input ball_128.bin --nsteps 5 --dt 1e-4 --eps 0.05 --energy-every 1 --output ball_128_final.bin --quiet
 
 clean:
-	rm -f $(PROGRAMS) *.o *.bin
+	rm -f $(PROGRAMS) nbody_omp *.o *.bin
