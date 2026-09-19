@@ -40,6 +40,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ========================================================================================
 
    : ------------------------------------------------------ :
@@ -490,8 +494,10 @@ static void compute_accelerations_naive (size_t  n,          // number of partic
 {
   const dtype  eps2 = eps * eps;
   size_t       i;
-  size_t       j;
 
+// parallelizing outer loop as no dependencies exist between different i particles
+// (threads write in different locations)
+#pragma omp parallel for
   for (i = 0u; i < n; ++i)
     {
       const dtype  xi  = x[i];
@@ -501,7 +507,8 @@ static void compute_accelerations_naive (size_t  n,          // number of partic
       dtype        ayi = (dtype) 0.0;
       dtype        azi = (dtype) 0.0;
 
-      for (j = 0u; j < n; ++j)
+      // making j private to each thread
+      for (size_t j = 0u; j < n; ++j)
         {
           if (j != i)
             {
