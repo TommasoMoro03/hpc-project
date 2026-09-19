@@ -30,6 +30,7 @@
  */
 
 #include "nbody_common.h"
+#include "utils/timing.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -585,18 +586,27 @@ static void kick (particles_t *p,       // particle velocities are modified in p
  *
  * This keeps positions and velocities synchronised at integer time levels 
  */
-static void leapfrog_dkd_step (particles_t *p,        // complete particle state, modified in place
-                               dtype        g,        // gravitational constant
-                               dtype        eps,      // softening length
-                               dtype        dt        // full time step
+static double leapfrog_dkd_step (particles_t *p,        // complete particle state, modified in place
+                                 dtype        g,        // gravitational constant
+                                 dtype        eps,      // softening length
+                                 dtype        dt        // full time step
 			       )
 {
+  double  force_start;
+  double  force_time;
+
   drift (p, (dtype) 0.5 * dt);
+
+  force_start = CPU_TIME_W;
   compute_accelerations_naive (p->n, g, p->mass, eps,
                                p->x, p->y, p->z,
                                p->ax, p->ay, p->az);
+  force_time = CPU_TIME_W - force_start;
+
   kick (p, dt);
   drift (p, (dtype) 0.5 * dt);
+
+  return force_time;
 }
 
 /*
@@ -830,10 +840,11 @@ int main (int argc, char **argv)
   // integration
 
   double max_rel_drift = 0.0;
-  
+  double force_time     = 0.0;
+
   for (size_t step = 1u; step <= nsteps; ++step)
     {
-      leapfrog_dkd_step (&particles, g, eps, dt);
+      force_time += leapfrog_dkd_step (&particles, g, eps, dt);
 
       // once in a while, get diagnostics
       //
@@ -866,6 +877,9 @@ int main (int argc, char **argv)
   printf ("# final: N=%zu steps=%zu arithmetic_dtype=%s max_relative_energy_drift=%.17g tolerance=%.17g status=%s\n",
           particles.n, nsteps, DTYPE_NAME, max_rel_drift, (double) energy_tol,
           (max_rel_drift <= (double) energy_tol) ? "OK" : "WARNING");
+
+  printf ("# timing: force_kernel_total=%.6g s force_kernel_per_step=%.6g s\n",
+          force_time, force_time / (double) nsteps);
 
   if (max_rel_drift > (double) energy_tol)
     fprintf (stderr,
