@@ -1,0 +1,5 @@
+*.o
+nbody_direct_serial
+generate_ic
+*.bin
+.DS_Store
