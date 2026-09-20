@@ -69,23 +69,32 @@ static void ring_free (ring_t *r)
 }
 
 
+/* Wall time split for one ring pass: compute in the force kernel versus
+ * communication in the MPI_Sendrecv shifts. */
+typedef struct ring_times_s
+{
+  double  kernel;
+  double  comm;
+} ring_times_t;
+
+
 /*
  * Accumulate the acceleration on the home particles from every particle in the
  * system, by rotating the home positions around the ring. The buffer starts as
  * a copy of the home chunk and is shifted ntasks-1 times. Each hop also carries
  * the chunk's particle count, so uneven chunk sizes are handled.
  *
- * Returns the wall time spent in the local force kernels.
+ * Returns the wall time split between the force kernel and the ring comm.
  */
-static double ring_accumulate (particles_t *home, ring_t *ring,
-                               dtype g, dtype eps,
-                               int rank, int ntasks, MPI_Comm comm)
+static ring_times_t ring_accumulate (particles_t *home, ring_t *ring,
+                                     dtype g, dtype eps,
+                                     int rank, int ntasks, MPI_Comm comm)
 {
   const int  next = (rank + 1) % ntasks;
   const int  prev = (rank - 1 + ntasks) % ntasks;
   const size_t  nhome = home->n;
 
-  double  kernel_time = 0.0;
+  ring_times_t  times = { 0.0, 0.0 };
   double  t0;
 
   // zero the accumulators
@@ -109,7 +118,7 @@ static double ring_accumulate (particles_t *home, ring_t *ring,
                                home->x, home->y, home->z,
                                ring->bx, ring->by, ring->bz,
                                home->ax, home->ay, home->az);
-      kernel_time += MPI_Wtime () - t0;
+      times.kernel += MPI_Wtime () - t0;
 
       // shift the buffer to the next rank, receive the previous one. The last
       // iteration has done all the work, so no shift is needed after it.
@@ -117,6 +126,7 @@ static double ring_accumulate (particles_t *home, ring_t *ring,
         {
           int  recv_count = 0;
 
+          t0 = MPI_Wtime ();
           MPI_Sendrecv (&buf_count, 1, MPI_INT, next, RING_TAG,
                         &recv_count, 1, MPI_INT, prev, RING_TAG,
                         comm, MPI_STATUS_IGNORE);
@@ -130,6 +140,8 @@ static double ring_accumulate (particles_t *home, ring_t *ring,
                         ring->rz, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
                         comm, MPI_STATUS_IGNORE);
 
+          times.comm += MPI_Wtime () - t0;
+
           // swap current and receive buffers
           dtype *tx = ring->bx; ring->bx = ring->rx; ring->rx = tx;
           dtype *ty = ring->by; ring->by = ring->ry; ring->ry = ty;
@@ -138,26 +150,24 @@ static double ring_accumulate (particles_t *home, ring_t *ring,
         }
     }
 
-  return kernel_time;
+  return times;
 }
 
 
 /*
  * One distributed DKD leapfrog step using the ring shift for the force. Only
- * the home particles are integrated. Returns the seconds in the force kernels.
+ * the home particles are integrated. Returns the kernel/comm time split.
  */
-static double ring_dkd_step (particles_t *home, ring_t *ring,
-                             dtype g, dtype eps, dtype dt,
-                             int rank, int ntasks, MPI_Comm comm)
+static ring_times_t ring_dkd_step (particles_t *home, ring_t *ring,
+                                   dtype g, dtype eps, dtype dt,
+                                   int rank, int ntasks, MPI_Comm comm)
 {
-  double  kernel_time;
-
   drift (home, (dtype) 0.5 * dt);
-  kernel_time = ring_accumulate (home, ring, g, eps, rank, ntasks, comm);
+  ring_times_t  times = ring_accumulate (home, ring, g, eps, rank, ntasks, comm);
   kick (home, dt);
   drift (home, (dtype) 0.5 * dt);
 
-  return kernel_time;
+  return times;
 }
 
 
@@ -441,10 +451,13 @@ int main (int argc, char **argv)
   // integration
   double max_rel_drift = 0.0;
   double force_time     = 0.0;
+  double comm_time      = 0.0;
 
   for (size_t step = 1u; step <= nsteps; ++step)
     {
-      force_time += ring_dkd_step (&home, &ring, g, eps, dt, rank, ntasks, comm);
+      const ring_times_t  st = ring_dkd_step (&home, &ring, g, eps, dt, rank, ntasks, comm);
+      force_time += st.kernel;
+      comm_time  += st.comm;
 
       if (((step % energy_every) == 0u) || (step == nsteps))
         {
@@ -509,15 +522,22 @@ int main (int argc, char **argv)
 
 
   // ························································
-  // summary
+  // summary. Timings vary across ranks, so report the slowest rank (the
+  // critical path) for each part.
+  double  force_max = 0.0;
+  double  comm_max  = 0.0;
+  MPI_Reduce (&force_time, &force_max, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+  MPI_Reduce (&comm_time,  &comm_max,  1, MPI_DOUBLE, MPI_MAX, 0, comm);
+
   if (rank == 0)
     {
       printf ("# final: N=%zu steps=%zu ranks=%d arithmetic_dtype=%s max_relative_energy_drift=%.17g tolerance=%.17g status=%s\n",
               ntot, nsteps, ntasks, DTYPE_NAME, max_rel_drift, (double) energy_tol,
               (max_rel_drift <= (double) energy_tol) ? "OK" : "WARNING");
 
-      printf ("# timing: force_kernel_total=%.6g s force_kernel_per_step=%.6g s\n",
-              force_time, force_time / (double) nsteps);
+      printf ("# timing: force_kernel_total=%.6g s comm_total=%.6g s force_per_step=%.6g s comm_per_step=%.6g s\n",
+              force_max, comm_max,
+              force_max / (double) nsteps, comm_max / (double) nsteps);
     }
 
   particles_free (&home);
