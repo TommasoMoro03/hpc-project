@@ -30,6 +30,11 @@ typedef struct particles_s
 /* Print a message to stderr and exit with failure. */
 void die (const char *format, ...);
 
+/* Command-line parsing helpers shared by the drivers. */
+size_t parse_size (const char *text, const char *name);
+dtype parse_dtype (const char *text, const char *name);
+const char *option_value (int *i, int argc, char **argv, const char *key);
+
 /* Cache-line aligned allocation, aborts on failure. */
 void *checked_aligned_alloc (size_t nbytes, size_t alignment);
 
