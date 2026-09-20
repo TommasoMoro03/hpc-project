@@ -1,4 +1,5 @@
 CC        ?= cc
+MPICC     ?= mpicc
 STD       ?= -std=c11
 CPPFLAGS  ?=
 CFLAGS    ?= -O2 -Wall -Wextra -Wpedantic
@@ -28,6 +29,9 @@ nbody_direct_serial: nbody_direct_serial.c $(CORE) $(HEADERS)
 nbody_omp: nbody_direct_serial.c $(CORE) $(HEADERS)
 	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) $(OMPFLAGS) -o $@ nbody_direct_serial.c $(CORE) $(LDLIBS)
 
+nbody_mpi: nbody_mpi.c $(CORE) $(HEADERS)
+	$(MPICC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ nbody_mpi.c $(CORE) $(LDLIBS)
+
 generate_ic: generate_ic.c $(HEADERS)
 	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
 
@@ -39,4 +43,4 @@ run-smoke: all
 	./nbody_direct_serial --input ball_128.bin --nsteps 5 --dt 1e-4 --eps 0.05 --energy-every 1 --output ball_128_final.bin --quiet
 
 clean:
-	rm -f $(PROGRAMS) nbody_omp *.o *.bin
+	rm -f $(PROGRAMS) nbody_omp nbody_mpi *.o *.bin

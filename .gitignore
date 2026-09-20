@@ -1,6 +1,7 @@
 *.o
 nbody_direct_serial
 nbody_omp
+nbody_mpi
 generate_ic
 *.bin
 *.out
