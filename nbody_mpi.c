@@ -1,12 +1,13 @@
 /*
  * nbody_mpi.c
  *
- * MPI driver for the direct N-body solver. This first version is simple: 
- * it sets up MPI, but does not yet distribute particles. Every rank
- * reads the full input and runs the same integration; only rank 0 prints.
- * I will add the ring-shift decomposition in later commits.
+ * MPI driver for the direct N-body solver, using the ring-shift structure
+ * required by the assignment. Each rank permanently owns N/P home particles.
+ * A buffer chunk of positions rotates around the ring of ranks; at each ring
+ * step forces between the home chunk and the buffer chunk are accumulated.
+ * After P steps every home particle has seen every source.
  *
- * All the physics, I/O and integrator come from nbody_core, which is the shared module
+ * The physics, I/O and integrator kernels come from nbody_core.
  */
 
 #include "nbody_core.h"
@@ -18,51 +19,252 @@
 
 #include <mpi.h>
 
-/* MPI datatype matching dtype, so the acceleration exchange follows the
- * precision selected at compile time. */
+/* MPI datatype matching dtype. */
 #if defined (NBODY_USE_FLOAT)
 #define NBODY_MPI_DTYPE MPI_FLOAT
 #else
 #define NBODY_MPI_DTYPE MPI_DOUBLE
 #endif
 
+/* Tags for the ring shift. */
+#define RING_TAG 100
+
+
 /*
- * One distributed DKD leapfrog step. Positions/velocities are replicated on
- * every rank. Each rank computes the accelerations of its own home particles
- * [i0, i1) against all sources, then the accelerations are gathered so every
- * rank holds the full set before the kick. Returns the seconds spent in the
- * local force kernel.
- *
- * counts/displs describe the per-rank home ranges for the MPI_Allgatherv.
+ * Position buffers used by the ring shift. Two are needed (send and receive)
+ * plus the accumulators. All are sized to the largest home chunk so any rank's
+ * chunk fits while it rotates.
  */
-static double distributed_dkd_step (particles_t *p, dtype g, dtype eps, dtype dt,
-                                    size_t i0, size_t i1,
-                                    const int *counts, const int *displs,
-                                    MPI_Comm comm)
+typedef struct ring_s
 {
-  double  force_start;
-  double  force_time;
+  size_t  capacity;   // max chunk size across ranks
+  dtype  *bx;         // current buffer x
+  dtype  *by;
+  dtype  *bz;
+  dtype  *rx;         // receive buffer x
+  dtype  *ry;
+  dtype  *rz;
+} ring_t;
 
-  drift (p, (dtype) 0.5 * dt);
 
-  force_start = MPI_Wtime ();
-  compute_accelerations_range (i0, i1, p->n, g, p->mass, eps,
-                               p->x, p->y, p->z,
-                               p->ax, p->ay, p->az);
-  force_time = MPI_Wtime () - force_start;
+static void ring_allocate (ring_t *r, size_t capacity)
+{
+  const size_t  bytes = capacity * sizeof (dtype);
 
-  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
-                  p->ax, counts, displs, NBODY_MPI_DTYPE, comm);
-  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
-                  p->ay, counts, displs, NBODY_MPI_DTYPE, comm);
-  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
-                  p->az, counts, displs, NBODY_MPI_DTYPE, comm);
-
-  kick (p, dt);
-  drift (p, (dtype) 0.5 * dt);
-
-  return force_time;
+  r->capacity = capacity;
+  r->bx = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
+  r->by = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
+  r->bz = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
+  r->rx = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
+  r->ry = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
+  r->rz = checked_aligned_alloc (bytes, NBODY_ALIGNMENT);
 }
+
+static void ring_free (ring_t *r)
+{
+  free (r->bx); free (r->by); free (r->bz);
+  free (r->rx); free (r->ry); free (r->rz);
+  r->bx = r->by = r->bz = r->rx = r->ry = r->rz = NULL;
+  r->capacity = 0u;
+}
+
+
+/*
+ * Accumulate the acceleration on the home particles from every particle in the
+ * system, by rotating the home positions around the ring. The buffer starts as
+ * a copy of the home chunk and is shifted ntasks-1 times. Each hop also carries
+ * the chunk's particle count, so uneven chunk sizes are handled.
+ *
+ * Returns the wall time spent in the local force kernels.
+ */
+static double ring_accumulate (particles_t *home, ring_t *ring,
+                               dtype g, dtype eps,
+                               int rank, int ntasks, MPI_Comm comm)
+{
+  const int  next = (rank + 1) % ntasks;
+  const int  prev = (rank - 1 + ntasks) % ntasks;
+  const size_t  nhome = home->n;
+
+  double  kernel_time = 0.0;
+  double  t0;
+
+  // zero the accumulators
+  memset (home->ax, 0, nhome * sizeof (dtype));
+  memset (home->ay, 0, nhome * sizeof (dtype));
+  memset (home->az, 0, nhome * sizeof (dtype));
+
+  // buffer starts as the home chunk itself
+  memcpy (ring->bx, home->x, nhome * sizeof (dtype));
+  memcpy (ring->by, home->y, nhome * sizeof (dtype));
+  memcpy (ring->bz, home->z, nhome * sizeof (dtype));
+  int  buf_count = (int) nhome;
+
+  for (int step = 0; step < ntasks; ++step)
+    {
+      const bool  same_chunk = (step == 0);
+
+      t0 = MPI_Wtime ();
+      accelerate_from_sources (nhome, (size_t) buf_count, same_chunk,
+                               g, home->mass, eps,
+                               home->x, home->y, home->z,
+                               ring->bx, ring->by, ring->bz,
+                               home->ax, home->ay, home->az);
+      kernel_time += MPI_Wtime () - t0;
+
+      // shift the buffer to the next rank, receive the previous one. The last
+      // iteration has done all the work, so no shift is needed after it.
+      if (step < ntasks - 1)
+        {
+          int  recv_count = 0;
+
+          MPI_Sendrecv (&buf_count, 1, MPI_INT, next, RING_TAG,
+                        &recv_count, 1, MPI_INT, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->bx, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->rx, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->by, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->ry, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->bz, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->rz, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+
+          // swap current and receive buffers
+          dtype *tx = ring->bx; ring->bx = ring->rx; ring->rx = tx;
+          dtype *ty = ring->by; ring->by = ring->ry; ring->ry = ty;
+          dtype *tz = ring->bz; ring->bz = ring->rz; ring->rz = tz;
+          buf_count = recv_count;
+        }
+    }
+
+  return kernel_time;
+}
+
+
+/*
+ * One distributed DKD leapfrog step using the ring shift for the force. Only
+ * the home particles are integrated. Returns the seconds in the force kernels.
+ */
+static double ring_dkd_step (particles_t *home, ring_t *ring,
+                             dtype g, dtype eps, dtype dt,
+                             int rank, int ntasks, MPI_Comm comm)
+{
+  double  kernel_time;
+
+  drift (home, (dtype) 0.5 * dt);
+  kernel_time = ring_accumulate (home, ring, g, eps, rank, ntasks, comm);
+  kick (home, dt);
+  drift (home, (dtype) 0.5 * dt);
+
+  return kernel_time;
+}
+
+
+/*
+ * Total energy of the distributed system. Kinetic is a local sum reduced over
+ * ranks. Potential is the softened pairwise sum: each rank accumulates the
+ * potential of its home particles against every source via one ring pass, then
+ * the partial sums are reduced. The 1/2 double-counting is corrected at the end.
+ */
+static dtype ring_total_energy (particles_t *home, ring_t *ring,
+                                dtype g, dtype eps,
+                                int rank, int ntasks, MPI_Comm comm,
+                                dtype *kinetic_out, dtype *potential_out)
+{
+  const size_t  nhome = home->n;
+  const int     next  = (rank + 1) % ntasks;
+  const int     prev  = (rank - 1 + ntasks) % ntasks;
+  const dtype   eps2  = eps * eps;
+  const dtype   m2    = home->mass * home->mass;
+
+  // kinetic: local sum then reduce
+  long double  kin_local = 0.0L;
+  for (size_t i = 0u; i < nhome; ++i)
+    {
+      const long double  vx = (long double) home->vx[i];
+      const long double  vy = (long double) home->vy[i];
+      const long double  vz = (long double) home->vz[i];
+      kin_local += vx * vx + vy * vy + vz * vz;
+    }
+  kin_local *= 0.5L * (long double) home->mass;
+
+  // potential: ring pass over source chunks. Each ordered pair (home i, source
+  // j) is counted once here and once when the roles are reversed on another
+  // rank, so the total is halved at the end.
+  memcpy (ring->bx, home->x, nhome * sizeof (dtype));
+  memcpy (ring->by, home->y, nhome * sizeof (dtype));
+  memcpy (ring->bz, home->z, nhome * sizeof (dtype));
+  int  buf_count = (int) nhome;
+
+  long double  pot_local = 0.0L;
+
+  for (int step = 0; step < ntasks; ++step)
+    {
+      const bool  same_chunk = (step == 0);
+
+      for (size_t i = 0u; i < nhome; ++i)
+        {
+          const dtype  xi = home->x[i];
+          const dtype  yi = home->y[i];
+          const dtype  zi = home->z[i];
+
+          for (int j = 0; j < buf_count; ++j)
+            {
+              if (!same_chunk || ((size_t) j != i))
+                {
+                  const dtype  dx   = ring->bx[j] - xi;
+                  const dtype  dy   = ring->by[j] - yi;
+                  const dtype  dz   = ring->bz[j] - zi;
+                  const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+                  const dtype  invr = (dtype) 1.0 / dtype_sqrt (r2);
+
+                  pot_local -= (long double) g * (long double) m2 * (long double) invr;
+                }
+            }
+        }
+
+      if (step < ntasks - 1)
+        {
+          int  recv_count = 0;
+
+          MPI_Sendrecv (&buf_count, 1, MPI_INT, next, RING_TAG,
+                        &recv_count, 1, MPI_INT, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->bx, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->rx, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->by, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->ry, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+          MPI_Sendrecv (ring->bz, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
+                        ring->rz, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
+                        comm, MPI_STATUS_IGNORE);
+
+          dtype *tx = ring->bx; ring->bx = ring->rx; ring->rx = tx;
+          dtype *ty = ring->by; ring->by = ring->ry; ring->ry = ty;
+          dtype *tz = ring->bz; ring->bz = ring->rz; ring->rz = tz;
+          buf_count = recv_count;
+        }
+    }
+
+  // the pairwise sum above double counts every pair, so halve it
+  pot_local *= 0.5L;
+
+  double  kin_global = 0.0;
+  double  pot_global = 0.0;
+  double  kin_send   = (double) kin_local;
+  double  pot_send   = (double) pot_local;
+
+  MPI_Allreduce (&kin_send, &kin_global, 1, MPI_DOUBLE, MPI_SUM, comm);
+  MPI_Allreduce (&pot_send, &pot_global, 1, MPI_DOUBLE, MPI_SUM, comm);
+
+  *kinetic_out   = (dtype) kin_global;
+  *potential_out = (dtype) pot_global;
+
+  return (dtype) (kin_global + pot_global);
+}
+
 
 /*
  * Print a compact command-line reference.
@@ -101,10 +303,6 @@ int main (int argc, char **argv)
   dtype        mass          = (dtype) 1.0;
   dtype        energy_tol    = (dtype) 1.0e-3;
   bool         quiet         = false;
-  particles_t  particles;
-  dtype        kinetic0;
-  dtype        potential0;
-  dtype        energy0;
 
   int          rank;
   int          ntasks;
@@ -121,12 +319,9 @@ int main (int argc, char **argv)
       MPI_Abort (MPI_COMM_WORLD, 1);
   }
 
-  // best practice that I take from the course template: work on a private communicator
   MPI_Comm_dup (MPI_COMM_WORLD, &comm);
   MPI_Comm_rank (comm, &rank);
   MPI_Comm_size (comm, &ntasks);
-
-  particles_init_empty (&particles);
 
 
   // parse CLI args
@@ -189,44 +384,52 @@ int main (int argc, char **argv)
     die ("--energy-tol must be positive");
 
 
-  // read particles. Every rank holds the full set; the O(N^2) force work is
-  // split by home range and the accelerations are gathered each step.
-  particles_read_binary (input_path, mass, &particles);
+  // ························································
+  // read the full file, then keep only this rank's home slice. The remainder
+  // (N % ntasks) is spread over the first ranks so chunks differ by at most one.
+  particles_t  full;
+  particles_init_empty (&full);
+  particles_read_binary (input_path, mass, &full);
 
-  // domain decomposition: give each rank a contiguous block of home particles.
-  // The remainder is spread over the first (n % ntasks) ranks so block sizes
-  // differ by at most one.
-  const size_t  n         = particles.n;
-  const size_t  base      = n / (size_t) ntasks;
-  const size_t  remainder = n % (size_t) ntasks;
+  const size_t  ntot      = full.n;
+  const size_t  base      = ntot / (size_t) ntasks;
+  const size_t  remainder = ntot % (size_t) ntasks;
 
-  int  *counts = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
-  int  *displs = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+  size_t  home_start = 0u;
+  for (int r = 0; r < rank; ++r)
+    home_start += base + ((size_t) r < remainder ? 1u : 0u);
+  const size_t  nhome    = base + ((size_t) rank < remainder ? 1u : 0u);
+  const size_t  max_home = base + (remainder > 0u ? 1u : 0u);
 
-  {
-    size_t  offset = 0u;
-    for (int r = 0; r < ntasks; ++r)
-      {
-        const size_t  count = base + ((size_t) r < remainder ? 1u : 0u);
-        counts[r] = (int) count;
-        displs[r] = (int) offset;
-        offset += count;
-      }
-  }
+  particles_t  home;
+  particles_allocate (&home, nhome, mass);
+  memcpy (home.x,  full.x  + home_start, nhome * sizeof (dtype));
+  memcpy (home.y,  full.y  + home_start, nhome * sizeof (dtype));
+  memcpy (home.z,  full.z  + home_start, nhome * sizeof (dtype));
+  memcpy (home.vx, full.vx + home_start, nhome * sizeof (dtype));
+  memcpy (home.vy, full.vy + home_start, nhome * sizeof (dtype));
+  memcpy (home.vz, full.vz + home_start, nhome * sizeof (dtype));
+  particles_free (&full);
 
-  const size_t  i0 = (size_t) displs[rank];
-  const size_t  i1 = i0 + (size_t) counts[rank];
+  ring_t  ring;
+  ring_allocate (&ring, max_home);
 
-  energy0 = total_energy (&particles, g, eps, &kinetic0, &potential0);
+
+  // ························································
+  // energy baseline
+  dtype  kinetic0;
+  dtype  potential0;
+  const dtype  energy0 = ring_total_energy (&home, &ring, g, eps,
+                                            rank, ntasks, comm,
+                                            &kinetic0, &potential0);
 
   if ((rank == 0) && !quiet)
     {
-      printf ("# MPI direct N-body DKD (work split by home range)\n");
+      printf ("# MPI direct N-body DKD (ring shift)\n");
       printf ("# ranks=%d arithmetic_dtype=%s binary_storage=float32 format=%s\n",
               ntasks, DTYPE_NAME, NBODY_BINARY_VERSION_TEXT);
       printf ("# N=%zu nsteps=%zu dt=%.17g eps=%.17g G=%.17g mass=%.17g\n",
-              particles.n, nsteps, (double) dt, (double) eps,
-              (double) g, (double) mass);
+              ntot, nsteps, (double) dt, (double) eps, (double) g, (double) mass);
       printf ("# step time kinetic potential total rel_energy_drift\n");
       printf ("%zu %.17g %.17g %.17g %.17g %.17g\n",
               (size_t) 0u, 0.0, (double) kinetic0, (double) potential0,
@@ -234,20 +437,22 @@ int main (int argc, char **argv)
     }
 
 
+  // ························································
   // integration
   double max_rel_drift = 0.0;
   double force_time     = 0.0;
 
   for (size_t step = 1u; step <= nsteps; ++step)
     {
-      force_time += distributed_dkd_step (&particles, g, eps, dt,
-                                          i0, i1, counts, displs, comm);
+      force_time += ring_dkd_step (&home, &ring, g, eps, dt, rank, ntasks, comm);
 
       if (((step % energy_every) == 0u) || (step == nsteps))
         {
           dtype         kinetic;
           dtype         potential;
-          const dtype   energy = total_energy (&particles, g, eps, &kinetic, &potential);
+          const dtype   energy = ring_total_energy (&home, &ring, g, eps,
+                                                    rank, ntasks, comm,
+                                                    &kinetic, &potential);
           const double  denom  = fmax (fabs ((double) energy0), (double) DTYPE_MIN_NORMAL);
           const double  rel    = fabs ((double) (energy - energy0)) / denom;
 
@@ -261,25 +466,62 @@ int main (int argc, char **argv)
     }
 
 
-  // write final file (rank 0 only for now)
-  if ((output_path != NULL) && (rank == 0))
-    particles_write_binary (output_path, &particles);
+  // ························································
+  // gather the home slices back to rank 0 and write the final state
+  if (output_path != NULL)
+    {
+      int  *counts = NULL;
+      int  *displs = NULL;
+      particles_t  gathered;
+      particles_init_empty (&gathered);
+
+      if (rank == 0)
+        {
+          counts = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+          displs = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+          size_t  offset = 0u;
+          for (int r = 0; r < ntasks; ++r)
+            {
+              const size_t  c = base + ((size_t) r < remainder ? 1u : 0u);
+              counts[r] = (int) c;
+              displs[r] = (int) offset;
+              offset += c;
+            }
+          particles_allocate (&gathered, ntot, mass);
+        }
+
+      const int  send = (int) nhome;
+      MPI_Gatherv (home.x,  send, NBODY_MPI_DTYPE, gathered.x,  counts, displs, NBODY_MPI_DTYPE, 0, comm);
+      MPI_Gatherv (home.y,  send, NBODY_MPI_DTYPE, gathered.y,  counts, displs, NBODY_MPI_DTYPE, 0, comm);
+      MPI_Gatherv (home.z,  send, NBODY_MPI_DTYPE, gathered.z,  counts, displs, NBODY_MPI_DTYPE, 0, comm);
+      MPI_Gatherv (home.vx, send, NBODY_MPI_DTYPE, gathered.vx, counts, displs, NBODY_MPI_DTYPE, 0, comm);
+      MPI_Gatherv (home.vy, send, NBODY_MPI_DTYPE, gathered.vy, counts, displs, NBODY_MPI_DTYPE, 0, comm);
+      MPI_Gatherv (home.vz, send, NBODY_MPI_DTYPE, gathered.vz, counts, displs, NBODY_MPI_DTYPE, 0, comm);
+
+      if (rank == 0)
+        {
+          particles_write_binary (output_path, &gathered);
+          particles_free (&gathered);
+          free (counts);
+          free (displs);
+        }
+    }
 
 
+  // ························································
   // summary
   if (rank == 0)
     {
       printf ("# final: N=%zu steps=%zu ranks=%d arithmetic_dtype=%s max_relative_energy_drift=%.17g tolerance=%.17g status=%s\n",
-              particles.n, nsteps, ntasks, DTYPE_NAME, max_rel_drift, (double) energy_tol,
+              ntot, nsteps, ntasks, DTYPE_NAME, max_rel_drift, (double) energy_tol,
               (max_rel_drift <= (double) energy_tol) ? "OK" : "WARNING");
 
       printf ("# timing: force_kernel_total=%.6g s force_kernel_per_step=%.6g s\n",
               force_time, force_time / (double) nsteps);
     }
 
-  particles_free (&particles);
-  free (counts);
-  free (displs);
+  particles_free (&home);
+  ring_free (&ring);
 
   MPI_Comm_free (&comm);
   MPI_Finalize ();

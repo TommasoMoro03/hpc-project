@@ -479,7 +479,66 @@ void compute_accelerations_naive (size_t  n,          // number of particles
 }
 
 /*
- * Drift all particles by a time interval using the current velocities.  
+ * Ring-shift force accumulation. Adds to (ax,ay,az) the pull on each home
+ * particle from every source in a separate buffer chunk. Called once per ring
+ * step as buffer chunks rotate, so the accumulators must persist between calls.
+ * same_chunk skips the i==j self-pair when the sources are the home chunk.
+ */
+void accelerate_from_sources (size_t        nhome,      // number of home targets
+                              size_t        nsrc,       // number of sources in buffer
+                              bool          same_chunk, // sources are the home chunk
+                              dtype         g,          // gravitational constant
+                              dtype         mass,       // mass of every source
+                              dtype         eps,        // Plummer softening length
+                              const dtype * hx,         // home x, read-only
+                              const dtype * hy,         // home y, read-only
+                              const dtype * hz,         // home z, read-only
+                              const dtype * sx,         // source x, read-only
+                              const dtype * sy,         // source y, read-only
+                              const dtype * sz,         // source z, read-only
+                              dtype       * ax,         // x acceleration, accumulated
+                              dtype       * ay,         // y acceleration, accumulated
+                              dtype       * az          // z acceleration, accumulated
+			      )
+{
+  const dtype  eps2 = eps * eps;
+  size_t       i;
+
+#pragma omp parallel for schedule(runtime)
+  for (i = 0u; i < nhome; ++i)
+    {
+      const dtype  xi  = hx[i];
+      const dtype  yi  = hy[i];
+      const dtype  zi  = hz[i];
+      dtype        axi = ax[i];
+      dtype        ayi = ay[i];
+      dtype        azi = az[i];
+
+      for (size_t j = 0u; j < nsrc; ++j)
+        {
+          if (!same_chunk || (j != i))
+            {
+              const dtype  dx   = sx[j] - xi;
+              const dtype  dy   = sy[j] - yi;
+              const dtype  dz   = sz[j] - zi;
+              const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+              const dtype  invr = (dtype) 1.0 / dtype_sqrt (r2);
+              const dtype  s    = g * mass * invr * invr * invr;
+
+              axi += dx * s;
+              ayi += dy * s;
+              azi += dz * s;
+            }
+        }
+
+      ax[i] = axi;
+      ay[i] = ayi;
+      az[i] = azi;
+    }
+}
+
+/*
+ * Drift all particles by a time interval using the current velocities.
  * The DKD leapfrog workflow calls it twice per step: a half-drift before the
  * force evaluation and a half-drift after the kick.
  *

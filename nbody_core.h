@@ -61,6 +61,17 @@ void compute_accelerations_naive (size_t n, dtype g, dtype mass, dtype eps,
                                    dtype *x, dtype *y, dtype *z,
                                    dtype *ax, dtype *ay, dtype *az);
 
+/* Accumulate into (ax,ay,az) the acceleration on nhome target particles
+ * (hx,hy,hz) due to nsrc source particles (sx,sy,sz). The accumulators are
+ * added to, not overwritten, so this can be called repeatedly as buffer
+ * chunks rotate through a ring. When same_chunk is true the sources are the
+ * home chunk itself, so the i==j self-pair is skipped. */
+void accelerate_from_sources (size_t nhome, size_t nsrc, bool same_chunk,
+                              dtype g, dtype mass, dtype eps,
+                              const dtype *hx, const dtype *hy, const dtype *hz,
+                              const dtype *sx, const dtype *sy, const dtype *sz,
+                              dtype *ax, dtype *ay, dtype *az);
+
 /* DKD leapfrog pieces. leapfrog_dkd_step returns the seconds spent in the
  * force kernel. */
 void drift (particles_t *p, dtype dt);
