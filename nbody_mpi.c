@@ -81,14 +81,21 @@ typedef struct ring_times_s
 /*
  * Accumulate the acceleration on the home particles from every particle in the
  * system, by rotating the home positions around the ring. The buffer starts as
- * a copy of the home chunk and is shifted ntasks-1 times. Each hop also carries
- * the chunk's particle count, so uneven chunk sizes are handled.
+ * a copy of the home chunk and is shifted ntasks-1 times.
  *
- * Returns the wall time split between the force kernel and the ring comm.
+ * Communication is overlapped with computation: before working on the current
+ * chunk we post non-blocking Isend/Irecv for the next chunk, so the transfer
+ * proceeds while the force kernel runs. Chunk sizes are known locally (every
+ * rank has all of them in chunk_sizes), so no count message is needed. The
+ * chunk held at ring step s originated on rank (rank - s + P) % P.
+ *
+ * Returns the wall time split between the force kernel and the (non-overlapped)
+ * ring comm, i.e. the time actually spent waiting in MPI.
  */
 static ring_times_t ring_accumulate (particles_t *home, ring_t *ring,
                                      dtype g, dtype eps,
-                                     int rank, int ntasks, MPI_Comm comm)
+                                     int rank, int ntasks,
+                                     const int *chunk_sizes, MPI_Comm comm)
 {
   const int  next = (rank + 1) % ntasks;
   const int  prev = (rank - 1 + ntasks) % ntasks;
@@ -111,6 +118,23 @@ static ring_times_t ring_accumulate (particles_t *home, ring_t *ring,
   for (int step = 0; step < ntasks; ++step)
     {
       const bool  same_chunk = (step == 0);
+      MPI_Request requests[6];
+      int         recv_count = 0;
+
+      // start the transfer of the next chunk before computing this one
+      if (step < ntasks - 1)
+        {
+          // the chunk that will arrive originated (step+1) hops upstream
+          const int  src_rank = (rank - (step + 1) + ntasks) % ntasks;
+          recv_count = chunk_sizes[src_rank];
+
+          MPI_Irecv (ring->rx, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG, comm, &requests[0]);
+          MPI_Irecv (ring->ry, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG, comm, &requests[1]);
+          MPI_Irecv (ring->rz, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG, comm, &requests[2]);
+          MPI_Isend (ring->bx, buf_count,  NBODY_MPI_DTYPE, next, RING_TAG, comm, &requests[3]);
+          MPI_Isend (ring->by, buf_count,  NBODY_MPI_DTYPE, next, RING_TAG, comm, &requests[4]);
+          MPI_Isend (ring->bz, buf_count,  NBODY_MPI_DTYPE, next, RING_TAG, comm, &requests[5]);
+        }
 
       t0 = MPI_Wtime ();
       accelerate_from_sources (nhome, (size_t) buf_count, same_chunk,
@@ -120,29 +144,14 @@ static ring_times_t ring_accumulate (particles_t *home, ring_t *ring,
                                home->ax, home->ay, home->az);
       times.kernel += MPI_Wtime () - t0;
 
-      // shift the buffer to the next rank, receive the previous one. The last
-      // iteration has done all the work, so no shift is needed after it.
+      // collect the transfer that ran alongside the compute, then adopt the
+      // received chunk as the current buffer
       if (step < ntasks - 1)
         {
-          int  recv_count = 0;
-
           t0 = MPI_Wtime ();
-          MPI_Sendrecv (&buf_count, 1, MPI_INT, next, RING_TAG,
-                        &recv_count, 1, MPI_INT, prev, RING_TAG,
-                        comm, MPI_STATUS_IGNORE);
-          MPI_Sendrecv (ring->bx, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
-                        ring->rx, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
-                        comm, MPI_STATUS_IGNORE);
-          MPI_Sendrecv (ring->by, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
-                        ring->ry, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
-                        comm, MPI_STATUS_IGNORE);
-          MPI_Sendrecv (ring->bz, buf_count, NBODY_MPI_DTYPE, next, RING_TAG,
-                        ring->rz, recv_count, NBODY_MPI_DTYPE, prev, RING_TAG,
-                        comm, MPI_STATUS_IGNORE);
-
+          MPI_Waitall (6, requests, MPI_STATUSES_IGNORE);
           times.comm += MPI_Wtime () - t0;
 
-          // swap current and receive buffers
           dtype *tx = ring->bx; ring->bx = ring->rx; ring->rx = tx;
           dtype *ty = ring->by; ring->by = ring->ry; ring->ry = ty;
           dtype *tz = ring->bz; ring->bz = ring->rz; ring->rz = tz;
@@ -160,10 +169,12 @@ static ring_times_t ring_accumulate (particles_t *home, ring_t *ring,
  */
 static ring_times_t ring_dkd_step (particles_t *home, ring_t *ring,
                                    dtype g, dtype eps, dtype dt,
-                                   int rank, int ntasks, MPI_Comm comm)
+                                   int rank, int ntasks,
+                                   const int *chunk_sizes, MPI_Comm comm)
 {
   drift (home, (dtype) 0.5 * dt);
-  ring_times_t  times = ring_accumulate (home, ring, g, eps, rank, ntasks, comm);
+  ring_times_t  times = ring_accumulate (home, ring, g, eps, rank, ntasks,
+                                         chunk_sizes, comm);
   kick (home, dt);
   drift (home, (dtype) 0.5 * dt);
 
@@ -424,6 +435,12 @@ int main (int argc, char **argv)
   ring_t  ring;
   ring_allocate (&ring, max_home);
 
+  // every rank's home size, so the ring can pre-post receives of the right
+  // length without exchanging counts
+  int  *chunk_sizes = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+  for (int r = 0; r < ntasks; ++r)
+    chunk_sizes[r] = (int) (base + ((size_t) r < remainder ? 1u : 0u));
+
 
   // ························································
   // energy baseline
@@ -455,7 +472,8 @@ int main (int argc, char **argv)
 
   for (size_t step = 1u; step <= nsteps; ++step)
     {
-      const ring_times_t  st = ring_dkd_step (&home, &ring, g, eps, dt, rank, ntasks, comm);
+      const ring_times_t  st = ring_dkd_step (&home, &ring, g, eps, dt,
+                                              rank, ntasks, chunk_sizes, comm);
       force_time += st.kernel;
       comm_time  += st.comm;
 
@@ -542,6 +560,7 @@ int main (int argc, char **argv)
 
   particles_free (&home);
   ring_free (&ring);
+  free (chunk_sizes);
 
   MPI_Comm_free (&comm);
   MPI_Finalize ();
