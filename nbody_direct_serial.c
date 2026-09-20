@@ -497,7 +497,7 @@ static void compute_accelerations_naive (size_t  n,          // number of partic
 
 // parallelizing outer loop as no dependencies exist between different i particles
 // (threads write in different locations)
-#pragma omp parallel for
+#pragma omp parallel for schedule(runtime)
   for (i = 0u; i < n; ++i)
     {
       const dtype  xi  = x[i];
