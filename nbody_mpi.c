@@ -18,6 +18,52 @@
 
 #include <mpi.h>
 
+/* MPI datatype matching dtype, so the acceleration exchange follows the
+ * precision selected at compile time. */
+#if defined (NBODY_USE_FLOAT)
+#define NBODY_MPI_DTYPE MPI_FLOAT
+#else
+#define NBODY_MPI_DTYPE MPI_DOUBLE
+#endif
+
+/*
+ * One distributed DKD leapfrog step. Positions/velocities are replicated on
+ * every rank. Each rank computes the accelerations of its own home particles
+ * [i0, i1) against all sources, then the accelerations are gathered so every
+ * rank holds the full set before the kick. Returns the seconds spent in the
+ * local force kernel.
+ *
+ * counts/displs describe the per-rank home ranges for the MPI_Allgatherv.
+ */
+static double distributed_dkd_step (particles_t *p, dtype g, dtype eps, dtype dt,
+                                    size_t i0, size_t i1,
+                                    const int *counts, const int *displs,
+                                    MPI_Comm comm)
+{
+  double  force_start;
+  double  force_time;
+
+  drift (p, (dtype) 0.5 * dt);
+
+  force_start = MPI_Wtime ();
+  compute_accelerations_range (i0, i1, p->n, g, p->mass, eps,
+                               p->x, p->y, p->z,
+                               p->ax, p->ay, p->az);
+  force_time = MPI_Wtime () - force_start;
+
+  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
+                  p->ax, counts, displs, NBODY_MPI_DTYPE, comm);
+  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
+                  p->ay, counts, displs, NBODY_MPI_DTYPE, comm);
+  MPI_Allgatherv (MPI_IN_PLACE, 0, NBODY_MPI_DTYPE,
+                  p->az, counts, displs, NBODY_MPI_DTYPE, comm);
+
+  kick (p, dt);
+  drift (p, (dtype) 0.5 * dt);
+
+  return force_time;
+}
+
 /*
  * Print a compact command-line reference.
  */
@@ -143,14 +189,39 @@ int main (int argc, char **argv)
     die ("--energy-tol must be positive");
 
 
-  // read particles. NOTE: for now every rank reads the whole file and runs the full integration
+  // read particles. Every rank holds the full set; the O(N^2) force work is
+  // split by home range and the accelerations are gathered each step.
   particles_read_binary (input_path, mass, &particles);
+
+  // domain decomposition: give each rank a contiguous block of home particles.
+  // The remainder is spread over the first (n % ntasks) ranks so block sizes
+  // differ by at most one.
+  const size_t  n         = particles.n;
+  const size_t  base      = n / (size_t) ntasks;
+  const size_t  remainder = n % (size_t) ntasks;
+
+  int  *counts = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+  int  *displs = checked_aligned_alloc ((size_t) ntasks * sizeof (int), NBODY_ALIGNMENT);
+
+  {
+    size_t  offset = 0u;
+    for (int r = 0; r < ntasks; ++r)
+      {
+        const size_t  count = base + ((size_t) r < remainder ? 1u : 0u);
+        counts[r] = (int) count;
+        displs[r] = (int) offset;
+        offset += count;
+      }
+  }
+
+  const size_t  i0 = (size_t) displs[rank];
+  const size_t  i1 = i0 + (size_t) counts[rank];
 
   energy0 = total_energy (&particles, g, eps, &kinetic0, &potential0);
 
   if ((rank == 0) && !quiet)
     {
-      printf ("# MPI direct N-body DKD (scaffolding, not yet distributed)\n");
+      printf ("# MPI direct N-body DKD (work split by home range)\n");
       printf ("# ranks=%d arithmetic_dtype=%s binary_storage=float32 format=%s\n",
               ntasks, DTYPE_NAME, NBODY_BINARY_VERSION_TEXT);
       printf ("# N=%zu nsteps=%zu dt=%.17g eps=%.17g G=%.17g mass=%.17g\n",
@@ -169,7 +240,8 @@ int main (int argc, char **argv)
 
   for (size_t step = 1u; step <= nsteps; ++step)
     {
-      force_time += leapfrog_dkd_step (&particles, g, eps, dt);
+      force_time += distributed_dkd_step (&particles, g, eps, dt,
+                                          i0, i1, counts, displs, comm);
 
       if (((step % energy_every) == 0u) || (step == nsteps))
         {
@@ -206,6 +278,8 @@ int main (int argc, char **argv)
     }
 
   particles_free (&particles);
+  free (counts);
+  free (displs);
 
   MPI_Comm_free (&comm);
   MPI_Finalize ();

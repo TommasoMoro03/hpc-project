@@ -410,17 +410,19 @@ void particles_write_binary (const char        *path,       // output file path
  * ... reason about the needed qualifiers to unleash compiler's optimization
  *
  */
-void compute_accelerations_naive (size_t  n,          // number of particles
-                                         dtype   g,          // gravitational constant
-                                         dtype   mass,       // mass of every source particle
-                                         dtype   eps,        // Plummer softening length
-                                         dtype * x,          // x positions, read-only
-                                         dtype * y,          // y positions, read-only
-                                         dtype * z,          // z positions, read-only
-                                         dtype * ax,         // x acceleration, overwritten
-                                         dtype * ay,         // y acceleration, overwritten
-                                         dtype * az          // z acceleration, overwritten
-					 )
+void compute_accelerations_range (size_t  i0,         // first target particle
+                                  size_t  i1,         // one past last target particle
+                                  size_t  n,          // number of source particles
+                                  dtype   g,          // gravitational constant
+                                  dtype   mass,       // mass of every source particle
+                                  dtype   eps,        // Plummer softening length
+                                  dtype * x,          // x positions, read-only
+                                  dtype * y,          // y positions, read-only
+                                  dtype * z,          // z positions, read-only
+                                  dtype * ax,         // x acceleration, overwritten
+                                  dtype * ay,         // y acceleration, overwritten
+                                  dtype * az          // z acceleration, overwritten
+				  )
 {
   const dtype  eps2 = eps * eps;
   size_t       i;
@@ -428,7 +430,7 @@ void compute_accelerations_naive (size_t  n,          // number of particles
 // parallelizing outer loop as no dependencies exist between different i particles
 // (threads write in different locations)
 #pragma omp parallel for schedule(runtime)
-  for (i = 0u; i < n; ++i)
+  for (i = i0; i < i1; ++i)
     {
       const dtype  xi  = x[i];
       const dtype  yi  = y[i];
@@ -459,6 +461,21 @@ void compute_accelerations_naive (size_t  n,          // number of particles
       ay[i] = ayi;
       az[i] = azi;
     }
+}
+
+void compute_accelerations_naive (size_t  n,          // number of particles
+                                  dtype   g,          // gravitational constant
+                                  dtype   mass,       // mass of every source particle
+                                  dtype   eps,        // Plummer softening length
+                                  dtype * x,          // x positions, read-only
+                                  dtype * y,          // y positions, read-only
+                                  dtype * z,          // z positions, read-only
+                                  dtype * ax,         // x acceleration, overwritten
+                                  dtype * ay,         // y acceleration, overwritten
+                                  dtype * az          // z acceleration, overwritten
+				  )
+{
+  compute_accelerations_range (0u, n, n, g, mass, eps, x, y, z, ax, ay, az);
 }
 
 /*

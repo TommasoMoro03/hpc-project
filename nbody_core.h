@@ -47,7 +47,16 @@ void particles_free (particles_t *p);
 void particles_read_binary (const char *path, dtype mass, particles_t *p);
 void particles_write_binary (const char *path, const particles_t *p);
 
-/* Direct O(N^2) softened gravitational acceleration. */
+/* Direct softened gravitational acceleration for target particles in the
+ * half-open range [i0, i1), computed against all n sources. Results are
+ * written into ax/ay/az at those same indices. */
+void compute_accelerations_range (size_t i0, size_t i1, size_t n,
+                                   dtype g, dtype mass, dtype eps,
+                                   dtype *x, dtype *y, dtype *z,
+                                   dtype *ax, dtype *ay, dtype *az);
+
+/* Full O(N^2) kernel: accelerations for all particles. Thin wrapper over
+ * compute_accelerations_range with the whole range. */
 void compute_accelerations_naive (size_t n, dtype g, dtype mass, dtype eps,
                                    dtype *x, dtype *y, dtype *z,
                                    dtype *ax, dtype *ay, dtype *az);
