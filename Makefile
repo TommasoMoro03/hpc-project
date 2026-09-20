@@ -7,7 +7,8 @@ LDLIBS    ?= -lm
 PRECISION ?= double
 
 PROGRAMS := nbody_direct_serial generate_ic
-HEADERS  := nbody_common.h utils/timing.h
+HEADERS  := nbody_common.h nbody_core.h utils/timing.h
+CORE     := nbody_core.c
 
 ifeq ($(PRECISION),float)
 PRECISION_CPPFLAGS := -DNBODY_USE_FLOAT
@@ -21,11 +22,11 @@ endif
 
 all: $(PROGRAMS)
 
-nbody_direct_serial: nbody_direct_serial.c $(HEADERS)
-	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
+nbody_direct_serial: nbody_direct_serial.c $(CORE) $(HEADERS)
+	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ nbody_direct_serial.c $(CORE) $(LDLIBS)
 
-nbody_omp: nbody_direct_serial.c $(HEADERS)
-	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) $(OMPFLAGS) -o $@ $< $(LDLIBS)
+nbody_omp: nbody_direct_serial.c $(CORE) $(HEADERS)
+	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) $(OMPFLAGS) -o $@ nbody_direct_serial.c $(CORE) $(LDLIBS)
 
 generate_ic: generate_ic.c $(HEADERS)
 	$(CC) $(STD) $(CPPFLAGS) $(PRECISION_CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
