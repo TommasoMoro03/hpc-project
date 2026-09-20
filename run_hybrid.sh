@@ -2,14 +2,17 @@
 #SBATCH --job-name=nbody_hybrid
 #SBATCH --partition=EPYC
 #SBATCH --nodes=1
-#SBATCH --ntasks=64
-#SBATCH --cpus-per-task=1
+#SBATCH --exclusive
 #SBATCH --time=00:30:00
 #SBATCH --output=%x.%j.out
 
 # Hybrid MPI+OpenMP layout comparison at a fixed total of 64 cores.
-# The 64 cores are split between MPI ranks and OpenMP threads:
-# from one rank per core (pure MPI) to few ranks with many threads each.
+# The 64 cores are split between MPI ranks and OpenMP threads, from one rank
+# per core (pure MPI) to few ranks with many threads each.
+#
+# The node is reserved --exclusive so each srun can freely regroup the cores
+# into its own ranks x threads layout. Fixing --cpus-per-task at the job level
+# would cap srun's cpus-per-task and silently prevent threading.
 
 module load openMPI/4.1.6
 
@@ -27,6 +30,6 @@ for split in "64 1" "32 2" "16 4" "8 8" "4 16" "2 32" "1 64"; do
     threads=$2
     export OMP_NUM_THREADS=$threads
     echo "### ranks=$ranks threads=$threads (total=$((ranks*threads)))"
-    srun --ntasks=$ranks --cpus-per-task=$threads \
+    srun --ntasks=$ranks --cpus-per-task=$threads --cpu-bind=cores \
          ./nbody_hybrid --input ic_50000.bin --nsteps 10 --dt 1e-4 --eps 0.05 --quiet
 done
