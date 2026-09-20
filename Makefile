@@ -2,7 +2,10 @@ CC        ?= cc
 MPICC     ?= mpicc
 STD       ?= -std=c11
 CPPFLAGS  ?=
-CFLAGS    ?= -O2 -Wall -Wextra -Wpedantic
+OPTFLAGS  ?= -O3
+ARCHFLAGS ?= -march=native
+WARNFLAGS ?= -Wall -Wextra -Wpedantic
+CFLAGS    ?= $(OPTFLAGS) $(ARCHFLAGS) $(WARNFLAGS)
 OMPFLAGS  ?= -fopenmp
 LDLIBS    ?= -lm
 PRECISION ?= double
