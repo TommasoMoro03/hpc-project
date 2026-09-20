@@ -1,6 +1,15 @@
 #ifndef TIMING_H
 #define TIMING_H
 
+/*
+ * Ask for the POSIX clocks. Under -std=c11 glibc hides clock_gettime and the
+ * CLOCK_* ids unless a feature-test macro is set before <time.h>. Same
+ * approach as the course examples (_XOPEN_SOURCE 700 implies POSIX.1-2008).
+ */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <time.h>
 
 /*

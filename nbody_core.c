@@ -1,3 +1,8 @@
+/* Request POSIX clocks before any system header is pulled in (see timing.h). */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include "nbody_core.h"
 #include "utils/timing.h"
 

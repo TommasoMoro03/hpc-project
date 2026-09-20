@@ -10,7 +10,6 @@
  */
 
 #include "nbody_core.h"
-#include "utils/timing.h"
 
 #include <stdbool.h>
 #include <stdio.h>
