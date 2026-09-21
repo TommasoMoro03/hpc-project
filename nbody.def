@@ -1,0 +1,55 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# Singularity/Apptainer definition for the direct N-body solver.
+# Build on the cluster with:
+#   singularity build nbody.sif nbody.def
+#
+# The image is self-contained (builds from ubuntu:22.04, no Docker needed).
+# OpenMPI is installed only to compile and link nbody_mpi; at runtime on Orfeo
+# Singularity binds the HOST MPI over the container one, so multi-node runs use
+# the host's network stack. Verify with `ldd` inside vs outside the container
+# that the MPI library loaded at runtime is the host one.
+
+%files
+    nbody_common.h        /opt/nbody/nbody_common.h
+    nbody_core.h          /opt/nbody/nbody_core.h
+    nbody_rsqrt.h         /opt/nbody/nbody_rsqrt.h
+    nbody_core.c          /opt/nbody/nbody_core.c
+    nbody_direct_serial.c /opt/nbody/nbody_direct_serial.c
+    nbody_mpi.c           /opt/nbody/nbody_mpi.c
+    generate_ic.c         /opt/nbody/generate_ic.c
+    Makefile              /opt/nbody/Makefile
+    utils/timing.h        /opt/nbody/utils/timing.h
+
+%post
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
+        gcc \
+        make \
+        libopenmpi-dev \
+        openmpi-bin \
+        libc6-dev
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+    # portable target, not -march=native. SPLIT_ACC helped on x86 (see notes).
+    cd /opt/nbody
+    make nbody_mpi nbody_hybrid generate_ic \
+        ARCHFLAGS="-march=x86-64-v3" \
+        CPPFLAGS="-DNBODY_SPLIT_ACC"
+    cp nbody_mpi nbody_hybrid generate_ic /usr/local/bin/
+
+    # bind points for host directories on the cluster
+    mkdir -p /work /scratch
+
+%environment
+    export OMP_PROC_BIND=close
+    export OMP_PLACES=cores
+
+%runscript
+    exec nbody_mpi "$@"
+
+%test
+    generate_ic --model 0 --n 128 --seed 1 --output /tmp/t.bin
+    nbody_mpi --input /tmp/t.bin --nsteps 3 --dt 1e-4 --eps 0.05 --quiet
