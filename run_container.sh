@@ -60,6 +60,17 @@ srun -n 4 --cpu-bind=cores --cpu-bind=verbose true 2>&1 | grep -i bind | head -4
 echo "-- container --"
 srun -n 4 --cpu-bind=cores --cpu-bind=verbose singularity exec "$SIF" true 2>&1 | grep -i bind | head -4
 
+# diagnostic: what does each binary report internally? If the compute times
+# differ, the two binaries are not doing the same work (e.g. different MPI/OMP).
+echo "### internal-timing diagnostic (P=4)"
+echo "-- native says --"
+srun -n 4 --cpu-bind=cores ./nbody_mpi $ARGS 2>/dev/null | grep -E "final|timing"
+echo "-- container says --"
+srun -n 4 --cpu-bind=cores singularity exec "$SIF" nbody_mpi $ARGS 2>/dev/null | grep -E "final|timing"
+echo "-- which mpirun/mpi does each see --"
+echo "native ldd:"; ldd ./nbody_mpi 2>/dev/null | grep -i mpi | head -3
+echo "container ldd:"; srun -n 1 singularity exec "$SIF" ldd /usr/local/bin/nbody_mpi 2>/dev/null | grep -i mpi | head -3
+
 for P in 2 4 8; do
     echo "### processes=$P"
 
