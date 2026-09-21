@@ -541,7 +541,54 @@ void compute_accelerations_naive (size_t  n,          // number of particles
                                   dtype * az          // z acceleration, overwritten
 				  )
 {
+#if defined (NBODY_NEWTON3)
+  // Newton's third law: each pair (i,j) is visited once and its force is
+  // applied to both particles (a_ij = -a_ji), halving the sqrt/division count.
+  // This writes to aj, so it is a data race if the outer loop is parallelised.
+  // This variant is therefore SERIAL only; the OpenMP/MPI paths keep the full
+  // all-pairs kernel.
+  const dtype  eps2 = eps * eps;
+
+  for (size_t i = 0u; i < n; ++i)
+    {
+      ax[i] = (dtype) 0.0;
+      ay[i] = (dtype) 0.0;
+      az[i] = (dtype) 0.0;
+    }
+
+  for (size_t i = 0u; i < n; ++i)
+    {
+      const dtype  xi = x[i];
+      const dtype  yi = y[i];
+      const dtype  zi = z[i];
+      dtype        axi = ax[i];
+      dtype        ayi = ay[i];
+      dtype        azi = az[i];
+
+      for (size_t j = i + 1u; j < n; ++j)
+        {
+          const dtype  dx   = x[j] - xi;
+          const dtype  dy   = y[j] - yi;
+          const dtype  dz   = z[j] - zi;
+          const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+          const dtype  invr = dtype_rsqrt (r2);
+          const dtype  s    = g * mass * invr * invr * invr;
+          const dtype  fx   = dx * s;
+          const dtype  fy   = dy * s;
+          const dtype  fz   = dz * s;
+
+          // force on i points towards j; equal and opposite on j
+          axi   += fx;   ayi   += fy;   azi   += fz;
+          ax[j] -= fx;   ay[j] -= fy;   az[j] -= fz;
+        }
+
+      ax[i] = axi;
+      ay[i] = ayi;
+      az[i] = azi;
+    }
+#else
   compute_accelerations_range (0u, n, n, g, mass, eps, x, y, z, ax, ay, az);
+#endif
 }
 
 /*
