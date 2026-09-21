@@ -4,6 +4,7 @@
 #endif
 
 #include "nbody_core.h"
+#include "nbody_rsqrt.h"
 #include "utils/timing.h"
 
 #include <errno.h>
@@ -448,7 +449,7 @@ void compute_accelerations_range (size_t  i0,         // first target particle
               const dtype  dy   = y[j] - yi;
               const dtype  dz   = z[j] - zi;
               const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
-              const dtype  invr = (dtype) 1.0 / dtype_sqrt (r2);
+              const dtype  invr = dtype_rsqrt (r2);
               const dtype  s    = g * mass * invr * invr * invr;
 
               axi += dx * s;
@@ -522,7 +523,7 @@ void accelerate_from_sources (size_t        nhome,      // number of home target
               const dtype  dy   = sy[j] - yi;
               const dtype  dz   = sz[j] - zi;
               const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
-              const dtype  invr = (dtype) 1.0 / dtype_sqrt (r2);
+              const dtype  invr = dtype_rsqrt (r2);
               const dtype  s    = g * mass * invr * invr * invr;
 
               axi += dx * s;
