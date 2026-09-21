@@ -436,9 +436,73 @@ void compute_accelerations_range (size_t  i0,         // first target particle
       const dtype  xi  = x[i];
       const dtype  yi  = y[i];
       const dtype  zi  = z[i];
-      dtype        axi = (dtype) 0.0;
-      dtype        ayi = (dtype) 0.0;
-      dtype        azi = (dtype) 0.0;
+
+#if defined (NBODY_SPLIT_ACC)
+      // Two partial accumulators per component. Splitting the accumulation
+      // breaks the serial dependency chain of a single accumulator, so the FP
+      // adds of consecutive j can be in flight at once. Whether this helps
+      // depends on the arch: it only pays off if the kernel is throughput-bound
+      // on the adds rather than latency-bound on the rsqrt/division.
+      dtype  axi0 = (dtype) 0.0, axi1 = (dtype) 0.0;
+      dtype  ayi0 = (dtype) 0.0, ayi1 = (dtype) 0.0;
+      dtype  azi0 = (dtype) 0.0, azi1 = (dtype) 0.0;
+
+      const size_t  n2 = (n / 2u) * 2u;
+
+      for (size_t j = 0u; j < n2; j += 2u)
+        {
+          if (j != i)
+            {
+              const dtype  dx   = x[j] - xi;
+              const dtype  dy   = y[j] - yi;
+              const dtype  dz   = z[j] - zi;
+              const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+              const dtype  invr = dtype_rsqrt (r2);
+              const dtype  s    = g * mass * invr * invr * invr;
+
+              axi0 += dx * s;
+              ayi0 += dy * s;
+              azi0 += dz * s;
+            }
+          if (j + 1u != i)
+            {
+              const dtype  dx   = x[j + 1u] - xi;
+              const dtype  dy   = y[j + 1u] - yi;
+              const dtype  dz   = z[j + 1u] - zi;
+              const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+              const dtype  invr = dtype_rsqrt (r2);
+              const dtype  s    = g * mass * invr * invr * invr;
+
+              axi1 += dx * s;
+              ayi1 += dy * s;
+              azi1 += dz * s;
+            }
+        }
+
+      for (size_t j = n2; j < n; ++j)   // tail for odd n
+        {
+          if (j != i)
+            {
+              const dtype  dx   = x[j] - xi;
+              const dtype  dy   = y[j] - yi;
+              const dtype  dz   = z[j] - zi;
+              const dtype  r2   = dx * dx + dy * dy + dz * dz + eps2;
+              const dtype  invr = dtype_rsqrt (r2);
+              const dtype  s    = g * mass * invr * invr * invr;
+
+              axi0 += dx * s;
+              ayi0 += dy * s;
+              azi0 += dz * s;
+            }
+        }
+
+      ax[i] = axi0 + axi1;
+      ay[i] = ayi0 + ayi1;
+      az[i] = azi0 + azi1;
+#else
+      dtype  axi = (dtype) 0.0;
+      dtype  ayi = (dtype) 0.0;
+      dtype  azi = (dtype) 0.0;
 
       // making j private to each thread
       for (size_t j = 0u; j < n; ++j)
@@ -461,6 +525,7 @@ void compute_accelerations_range (size_t  i0,         // first target particle
       ax[i] = axi;
       ay[i] = ayi;
       az[i] = azi;
+#endif
     }
 }
 
