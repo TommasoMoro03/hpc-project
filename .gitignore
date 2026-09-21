@@ -2,7 +2,9 @@
 nbody_direct_serial
 nbody_omp
 nbody_mpi
+nbody_hybrid
 generate_ic
 *.bin
 *.out
+*.sif
 .DS_Store
