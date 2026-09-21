@@ -7,4 +7,5 @@ generate_ic
 *.bin
 *.out
 *.sif
+*.tar
 .DS_Store
