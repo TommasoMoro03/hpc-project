@@ -71,6 +71,10 @@ echo "-- which mpirun/mpi does each see --"
 echo "native ldd:"; ldd ./nbody_mpi 2>/dev/null | grep -i mpi | head -3
 echo "container ldd:"; srun -n 1 singularity exec "$SIF" ldd /usr/local/bin/nbody_mpi 2>/dev/null | grep -i mpi | head -3
 
+# pull the solver's own force_kernel_total (excludes srun launch/teardown) from
+# a run's stdout
+kernel_time () { grep -oE "force_kernel_total=[0-9.]+" | head -1 | cut -d= -f2; }
+
 for P in 2 4 8; do
     echo "### processes=$P"
 
@@ -78,23 +82,31 @@ for P in 2 4 8; do
     timed_run srun -n $P --cpu-bind=cores ./nbody_mpi $ARGS > /dev/null
     timed_run srun -n $P --cpu-bind=cores singularity exec "$SIF" nbody_mpi $ARGS > /dev/null
 
-    nat=""
+    # wall = whole srun (includes MPI launch overhead); kern = solver's own
+    # force-kernel time (the honest compute-overhead metric)
+    nat_wall=""; nat_kern=""
     for r in $(seq 1 $REPS); do
-        nat="$nat $(timed_run srun -n $P --cpu-bind=cores ./nbody_mpi $ARGS)"
+        out=$(srun -n $P --cpu-bind=cores ./nbody_mpi $ARGS 2>/dev/null)
+        nat_kern="$nat_kern $(echo "$out" | kernel_time)"
+        nat_wall="$nat_wall $(timed_run srun -n $P --cpu-bind=cores ./nbody_mpi $ARGS)"
     done
 
-    con=""
+    con_wall=""; con_kern=""
     for r in $(seq 1 $REPS); do
-        con="$con $(timed_run srun -n $P --cpu-bind=cores singularity exec "$SIF" nbody_mpi $ARGS)"
+        out=$(srun -n $P --cpu-bind=cores singularity exec "$SIF" nbody_mpi $ARGS 2>/dev/null)
+        con_kern="$con_kern $(echo "$out" | kernel_time)"
+        con_wall="$con_wall $(timed_run srun -n $P --cpu-bind=cores singularity exec "$SIF" nbody_mpi $ARGS)"
     done
 
-    read nat_med nat_sd < <(echo "$nat" | tr ' ' '\n' | stats)
-    read con_med con_sd < <(echo "$con" | tr ' ' '\n' | stats)
-    overhead=$(python3 -c "print(f'{(($con_med-$nat_med)/$nat_med*100):.2f}')")
+    read nw_med nw_sd < <(echo "$nat_wall" | tr ' ' '\n' | stats)
+    read cw_med cw_sd < <(echo "$con_wall" | tr ' ' '\n' | stats)
+    read nk_med nk_sd < <(echo "$nat_kern" | tr ' ' '\n' | stats)
+    read ck_med ck_sd < <(echo "$con_kern" | tr ' ' '\n' | stats)
+    ov_wall=$(python3 -c "print(f'{(($cw_med-$nw_med)/$nw_med*100):.2f}')")
+    ov_kern=$(python3 -c "print(f'{(($ck_med-$nk_med)/$nk_med*100):.2f}')")
 
-    echo "native    : ${nat_med} +- ${nat_sd} s"
-    echo "container : ${con_med} +- ${con_sd} s"
-    echo "overhead  : ${overhead} %"
+    echo "wall   native ${nw_med} +- ${nw_sd} s | container ${cw_med} +- ${cw_sd} s | overhead ${ov_wall} %"
+    echo "kernel native ${nk_med} +- ${nk_sd} s | container ${ck_med} +- ${ck_sd} s | overhead ${ov_kern} %"
 done
 
 echo "### launch overhead (singularity exec ... true, 10 reps)"
